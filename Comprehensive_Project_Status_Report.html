@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Technical Architecture Report</title>
+    <!-- Load Mermaid for diagrams -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({startOnLoad:true});</script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #222;
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 40px;
+        }
+        h2 {
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 5px;
+            margin-top: 40px;
+        }
+        h3 {
+            color: #34495e;
+            margin-top: 20px;
+        }
+        ul {
+            padding-left: 20px;
+        }
+        li {
+            margin-bottom: 12px;
+        }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9em;
+            color: #c7254e;
+        }
+        .diagram-container {
+            text-align: center;
+            margin: 30px 0;
+            padding: 20px;
+            background-color: #fdfdfd;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="section">
+        <h2>1. Data Pipeline and Preprocessing Subsystem</h2>
+        
+        <div class="diagram-container">
+            <div class="mermaid">
+                graph LR
+                    A[Raw OCT Scans] --> B[Resize 224x224]
+                    B --> C[ToTensor]
+                    C --> D[Normalize]
+                    D --> E[Elastic Deformations]
+                    E --> F[Speckle Noise Injection]
+                    F --> G[PyTorch DataLoader]
+            </div>
+        </div>
+
+        <h3>Technical Specifications:</h3>
+        <ul>
+            <li><strong>Tensor Normalization:</strong> Utilized <code>torchvision.transforms.Normalize</code> using ImageNet statistics (Mean: <code>[0.485, 0.456, 0.406]</code>, Std: <code>[0.229, 0.224, 0.225]</code>) to center the pixel intensity distribution, accelerating gradient convergence.</li>
+            <li><strong>Biological Augmentations:</strong> Engineered custom transformations to simulate hardware variations. Applied elastic deformations using OpenCV grid mappings to replicate natural retinal curvature variations, and injected Gaussian speckle noise to simulate low-SNR (Signal-to-Noise Ratio) scans common in older OCT machines.</li>
+            <li><strong>Memory Management:</strong> Implemented a <code>torch.utils.data.DataLoader</code> with <code>num_workers=4</code> and <code>pin_memory=True</code> to optimize the transfer of tensors from host RAM to GPU VRAM during training batches.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>2. DenseNet-121 Feature Extraction & Classification</h2>
+        
+        <div class="diagram-container">
+            <div class="mermaid">
+                graph TD
+                    A[Normalized Input Tensor] --> B[DenseBlock 1-4]
+                    B --> C[Global Average Pooling]
+                    C --> D[Modified Linear Classifier]
+                    D --> E[Softmax Output 4 Classes]
+            </div>
+        </div>
+
+        <h3>Technical Specifications:</h3>
+        <ul>
+            <li><strong>Architecture Selection:</strong> Deployed <code>torchvision.models.densenet121</code>. Unlike ResNet which adds features residually, DenseNet concatenates feature maps from preceding layers, preserving low-level edge features (critical for recognizing retinal layer boundaries) throughout the deep network.</li>
+            <li><strong>Transfer Learning:</strong> Executed layer-freezing on the initial convolutional layers to preserve pre-trained ImageNet weights. The final classification head (<code>model.classifier</code>) was replaced with a new <code>nn.Linear(1024, 4)</code> layer initialized with Xavier uniform weights to map to the 4 target pathologies (CNV, DME, Drusen, Normal).</li>
+            <li><strong>Optimization:</strong> The backward pass utilized the <code>Adam</code> optimizer with a Cross-Entropy Loss function (<code>nn.CrossEntropyLoss</code>) and an adaptive learning rate scheduler to dynamically decay the learning rate upon plateauing validation loss.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>3. Weakly Supervised Localization via Grad-CAM</h2>
+
+        <div class="diagram-container">
+            <div class="mermaid">
+                graph LR
+                    A[Final Conv Layer] -- Forward Pass --> B[Activations]
+                    A -- Backward Pass --> C[Gradients]
+                    B --> D[Multiply & Global Average]
+                    C --> D
+                    D --> E[ReLU Activation]
+                    E --> F[Interpolate to 224x224]
+                    F --> G[Heatmap Overlay]
+            </div>
+        </div>
+
+        <h3>Technical Specifications:</h3>
+        <ul>
+            <li><strong>Hook Registration:</strong> Implemented <code>register_forward_hook</code> and <code>register_full_backward_hook</code> targeting <code>features.denseblock4.denselayer16.conv2</code> to capture feature map activations and corresponding backpropagated gradients during the evaluation phase.</li>
+            <li><strong>Heatmap Generation:</strong> Calculated the Global Average Pooling (GAP) of the gradients to obtain neuron importance weights. These weights were matrix-multiplied with the forward activations. A ReLU activation was applied to suppress negative pixels belonging to other classes, isolating the target pathology (e.g., fluid cysts).</li>
+            <li><strong>Spatial Resolution Recovery:</strong> Utilized <code>torch.nn.functional.interpolate</code> with <code>mode='bilinear'</code> to upsample the low-resolution 7x7 Grad-CAM heatmap back to the original 224x224 input image space.</li>
+            <li><strong>Algorithmic Bounding Box:</strong> Applied a binary threshold to the heatmap array, followed by <code>cv2.findContours</code> and <code>cv2.boundingRect</code> to algorithmically extract the spatial coordinates of the fluid and draw the final localization box.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>4. Uncertainty Quantification via Monte Carlo Dropout</h2>
+
+        <div class="diagram-container">
+            <div class="mermaid">
+                graph LR
+                    A[Input Tensor] --> B[Forward Pass 1 with Dropout]
+                    A --> C[Forward Pass 2 with Dropout]
+                    A --> D[Forward Pass N with Dropout]
+                    B --> E[Softmax Stack]
+                    C --> E
+                    D --> E
+                    E --> F[Calculate Mean & Variance]
+                    F --> G[Uncertainty Score]
+            </div>
+        </div>
+
+        <h3>Technical Specifications:</h3>
+        <ul>
+            <li><strong>Stochastic Inference:</strong> Standard PyTorch evaluation mode (<code>model.eval()</code>) normally disables dropout layers. We implemented a custom override function to force <code>nn.Dropout</code> layers to remain active (<code>training=True</code>) during the inference phase.</li>
+            <li><strong>Monte Carlo Sampling:</strong> For a single given input tensor, the system executes <i>T</i> (e.g., T=20) independent forward passes. Due to the active dropout masks, each pass relies on a slightly different sub-network of neurons, yielding a distribution of softmax probability outputs rather than a single deterministic prediction.</li>
+            <li><strong>Variance Calculation:</strong> The system calculates the statistical variance across the <i>T</i> predictions. High variance indicates that the model is highly sensitive to the dropped neurons, generating an actionable 'Uncertainty Score'. This serves as a clinical safety net to automatically flag ambiguous or out-of-distribution (OOD) scans for mandatory human review.</li>
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>5. Live Camera Inference & OpenCV Subsystem</h2>
+        
+        <h3>Technical Specifications:</h3>
+        <ul>
+            <li><strong>Live Video Capture:</strong> Instantiated a threaded <code>cv2.VideoCapture(0)</code> loop to continuously read BGR frames from the hardware camera buffer.</li>
+            <li><strong>Matrix Transformations:</strong> Implemented real-time color space conversion (<code>cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)</code>) to match PyTorch's expected tensor format, followed by array slicing to crop the Region of Interest (ROI) defined by the on-screen targeting UI.</li>
+            <li><strong>Inference Threading:</strong> Upon interrupt trigger (Spacebar), the cropped NumPy array is converted to a PIL Image, transformed into an un-squeezed tensor (<code>shape: [1, 3, 224, 224]</code>), and passed through the model via <code>input_tensor.requires_grad_(True)</code> to enable Grad-CAM backpropagation in a live environment.</li>
+        </ul>
+    </div>
+
+</body>
+</html>
